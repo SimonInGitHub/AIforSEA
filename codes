@@ -1,0 +1,390 @@
+#*************************************************************************************************
+#                            Grab A.I for SEA Challeng 2019                                      *
+#                                    by Leo Sai Mun                                              *
+#                                    16th June 2019                                              *
+#*************************************************************************************************
+import os
+import pandas as pd
+import numpy as np
+import glob
+import time
+import gc
+import xgboost as xgb
+import catboost as cat
+import lightgbm as lgb
+from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.model_selection import StratifiedKFold
+
+t0 = time.time()
+t = time.time()
+
+#*************** Delete bookingIDs with conflicting target labels ***********************************
+
+def Delete_conflict():  
+    
+    print("Deleting bookingIDs with conflicting labels...")
+    label ='../input/ai-for-sea-labels/part-00000-e9445087-aa0a-433b-a7f6-7f4c19d78ad6-c000.csv' # Please specify location of folder
+                                                                                                 # that consists train set labels
+    df=pd.read_csv( label )
+    df.drop_duplicates(subset='bookingID', keep=False, inplace=True) 
+    
+    holdout_labels ='[folder location]/[name of holdout set labels].csv' # Please specify location of folder that consists of holdout
+                                                                         # set labels
+                                                                         
+    df2=pd.read_csv( holdout_labels )                                                                    
+    print("Done deleting bookingIDs with conflicting labels")
+    return df, df2
+
+#*************** Combine Multiple Datasets (Include Holdout set****************************************
+
+def Combine_data ():
+    all_files = glob.glob('../input/ai-for-sea/*.csv') # Please specify folder location consisting ALL 
+                                                       #  datasets, including hold out set
+    t = time.time()               
+    raw_data = [] # Create an empty list                      
+    for i, csv in enumerate(all_files): #  Iterate over csv_files
+        df = pd.read_csv(csv)
+        print("Done reading file", str(i), "Time elapse:", round((time.time()-t),3), "secs. Shape= ", df.shape)
+        t = time.time()                 
+        raw_data.append(df)
+                      
+    df_combined = pd.concat(raw_data)
+    df_combined.loc[df_combined['Accuracy']> 40, ['Speed']]=np.NaN    #nullify unreliable speed data (with GPS accuracy > 40m)
+    print("Done Concatening all files. Time elapse:", round((time.time()-t),3), "secs. Shape= ", df_combined.shape)
+    t = time.time() 
+    return df_combined
+    
+#*************** Preprocess data Part 1: Basic Data ******************************************************
+
+def Preprocess_data_Basic (df):
+    t = time.time() 
+    print("Start Processing Basic Data...")
+    df=df[['bookingID', 'Accuracy', 'Bearing', 'second', 'Speed']] 
+    Agg= {'Accuracy'         : ['min', 'max','mean','std','median'],
+       'Bearing'          : ['min', 'max','mean','std','median'],
+       'second'           : ['min', 'max','mean','std','median'],
+       'Speed'            : ['min', 'max','mean','std','median'] 
+                             }
+
+    df_agg= df.groupby('bookingID').agg(Agg)
+    df_agg.columns = pd.Index([ e[0] + "_" + e[1] for e in df_agg.columns.tolist()]) #rename all columns to single layer
+    df_agg=df_agg.reset_index()   
+    del df
+    gc.collect()
+    
+    print("   Done processing basic data. Time elapse:", round((time.time()-t),3), "secs. Shape= ", df_agg.shape)
+    return df_agg
+    
+#*************** Preprocess data Part 2 : Accerometer Data **********************************************
+
+def Preprocess_data_accr (df):
+    t = time.time()
+    print ("Starting processing accelerometer data...")
+    df=df[['bookingID', 'acceleration_x', 'acceleration_y', 'acceleration_z']]    
+    #**** Duplicate values to new columns **********
+    df['+ve_accr_x']=df['acceleration_x']
+    df['-ve_accr_x']=df['acceleration_x']
+    df['+ve_accr_y']=df['acceleration_y']
+    df['-ve_accr_y']=df['acceleration_y'] 
+    df['+ve_accr_z']=df['acceleration_z']
+    df['-ve_accr_z']=df['acceleration_z'] 
+    
+    #**** Initializing new columns to NaN **********
+    df['excs_+ve_accr_x']=np.NaN
+    df['excs_-ve_accr_x']=np.NaN
+    df['excs_+ve_accr_y']=np.NaN
+    df['excs_-ve_accr_y']=np.NaN 
+    df['excs_+ve_accr_z']=np.NaN
+    df['excs_-ve_accr_z']=np.NaN
+
+    #**** Seperate positive values from negative values **********
+    
+    df.loc[df['+ve_accr_x']<=0, ['+ve_accr_x']]=np.NaN
+    df.loc[df['-ve_accr_x']>=0, ['-ve_accr_x']]=np.NaN
+    df.loc[df['+ve_accr_y']<=0, ['+ve_accr_y']]=np.NaN
+    df.loc[df['-ve_accr_y']>=0, ['-ve_accr_y']]=np.NaN
+    df.loc[df['+ve_accr_z']<=0, ['+ve_accr_z']]=np.NaN
+    df.loc[df['-ve_accr_z']>=0, ['-ve_accr_z']]=np.NaN
+
+    #****Invert all -ve sign ***********************
+    df['-ve_accr_x']=-df['-ve_accr_x']
+    df['-ve_accr_y']=-df['-ve_accr_y']   
+    df['-ve_accr_z']=-df['-ve_accr_z'] 
+    
+    #**** Mark all readings > 70th percentile **********
+    df.loc[df['+ve_accr_x']>df['+ve_accr_x'].quantile(0.8), ['excs_+ve_accr_x']]=1
+    df.loc[df['-ve_accr_x']>df['-ve_accr_x'].quantile(0.8), ['excs_-ve_accr_x']]=1
+    df.loc[df['+ve_accr_y']>df['+ve_accr_y'].quantile(0.8), ['excs_+ve_accr_y']]=1
+    df.loc[df['-ve_accr_y']>df['-ve_accr_y'].quantile(0.8), ['excs_-ve_accr_y']]=1
+    df.loc[df['+ve_accr_z']>df['+ve_accr_z'].quantile(0.8), ['excs_+ve_accr_z']]=1
+    df.loc[df['-ve_accr_z']>df['-ve_accr_z'].quantile(0.8), ['excs_-ve_accr_z']]=1
+    
+    #****Aggregating Data ***********************
+    Agg= {'+ve_accr_x'         : ['min', 'max','mean','std','median'],
+          '-ve_accr_x'         : ['min', 'max','mean','std','median'],
+          '+ve_accr_y'         : ['min', 'max','mean','std','median'],
+          '-ve_accr_y'         : ['min', 'max','mean','std','median'],
+          '+ve_accr_z'         : ['min', 'max','mean','std','median'],
+          '-ve_accr_z'         : ['min', 'max','mean','std','median'],
+          
+          'excs_+ve_accr_x'         : ['sum'],
+          'excs_-ve_accr_x'         : ['sum'],
+          'excs_+ve_accr_y'         : ['sum'],
+          'excs_-ve_accr_y'         : ['sum'],
+          'excs_+ve_accr_z'         : ['sum'],
+          'excs_-ve_accr_z'         : ['sum'],
+                                       }
+
+    df_agg= df.groupby('bookingID').agg(Agg)
+    df_agg.columns = pd.Index([ e[0] + "_" + e[1] for e in df_agg.columns.tolist()]) #rename all columns to single layer
+    df_agg=df_agg.reset_index()   
+    del df
+    gc.collect()
+    
+    print("   Done processing accerometer data. Time elapse:", round((time.time()-t),3), "secs. Shape= ", df_agg.shape)
+
+    return df_agg
+
+#*************** Preprocess data Part 3 : Gyroscope Data **********************************************
+
+def Preprocess_data_gyro (df):
+    t = time.time()
+    print ("Starting processing Gyroscope data...")
+    
+    df=df[['bookingID', 'gyro_x', 'gyro_y', 'gyro_z']]        
+    #**** Duplicate values to new columns **********
+    df['+ve_gyro_x']=df['gyro_x']
+    df['-ve_gyro_x']=df['gyro_x']
+    df['+ve_gyro_y']=df['gyro_y']
+    df['-ve_gyro_y']=df['gyro_y'] 
+    df['+ve_gyro_z']=df['gyro_z']
+    df['-ve_gyro_z']=df['gyro_z'] 
+    
+    #**** Initializing new columns to NaN **********
+    df['excs_+ve_gyro_x']=np.NaN
+    df['excs_-ve_gyro_x']=np.NaN
+    df['excs_+ve_gyro_y']=np.NaN
+    df['excs_-ve_gyro_y']=np.NaN 
+    df['excs_+ve_gyro_z']=np.NaN
+    df['excs_-ve_gyro_z']=np.NaN
+
+    #**** Seperate positive values from negative values **********
+    
+    df.loc[df['+ve_gyro_x']<=0, ['+ve_gyro_x']]=np.NaN
+    df.loc[df['-ve_gyro_x']>=0, ['-ve_gyro_x']]=np.NaN
+    df.loc[df['+ve_gyro_y']<=0, ['+ve_gyro_y']]=np.NaN
+    df.loc[df['-ve_gyro_y']>=0, ['-ve_gyro_y']]=np.NaN
+    df.loc[df['+ve_gyro_z']<=0, ['+ve_gyro_z']]=np.NaN
+    df.loc[df['-ve_gyro_z']>=0, ['-ve_gyro_z']]=np.NaN
+
+    #****Invert all -ve sign ***********************
+    df['-ve_gyro_x']=-df['-ve_gyro_x']
+    df['-ve_gyro_y']=-df['-ve_gyro_y']   
+    df['-ve_gyro_z']=-df['-ve_gyro_z'] 
+    
+    #**** Mark all readings > 70th percentile **********
+    df.loc[df['+ve_gyro_x']>df['+ve_gyro_x'].quantile(0.8), ['excs_+ve_gyro_x']]=1
+    df.loc[df['-ve_gyro_x']>df['-ve_gyro_x'].quantile(0.8), ['excs_-ve_gyro_x']]=1
+    df.loc[df['+ve_gyro_y']>df['+ve_gyro_y'].quantile(0.8), ['excs_+ve_gyro_y']]=1
+    df.loc[df['-ve_gyro_y']>df['-ve_gyro_y'].quantile(0.8), ['excs_-ve_gyro_y']]=1
+    df.loc[df['+ve_gyro_z']>df['+ve_gyro_z'].quantile(0.8), ['excs_+ve_gyro_z']]=1
+    df.loc[df['-ve_gyro_z']>df['-ve_gyro_z'].quantile(0.8), ['excs_-ve_gyro_z']]=1
+    
+    #****Aggregating Data ***********************
+    Agg= {'+ve_gyro_x'         : ['min', 'max','mean','std','median'],
+          '-ve_gyro_x'         : ['min', 'max','mean','std','median'],
+          '+ve_gyro_y'         : ['min', 'max','mean','std','median'],
+          '-ve_gyro_y'         : ['min', 'max','mean','std','median'],
+          '+ve_gyro_z'         : ['min', 'max','mean','std','median'],
+          '-ve_gyro_z'         : ['min', 'max','mean','std','median'],
+          
+          'excs_+ve_gyro_x'         : ['sum'],
+          'excs_-ve_gyro_x'         : ['sum'],
+          'excs_+ve_gyro_y'         : ['sum'],
+          'excs_-ve_gyro_y'         : ['sum'],
+          'excs_+ve_gyro_z'         : ['sum'],
+          'excs_-ve_gyro_z'         : ['sum'],
+          
+                             }
+
+    df_agg= df.groupby('bookingID').agg(Agg)
+    df_agg.columns = pd.Index([ e[0] + "_" + e[1] for e in df_agg.columns.tolist()]) #rename all columns to single layer
+    df_agg=df_agg.reset_index()   
+    del df
+    gc.collect()
+    
+    print("   Done processing gyroscope data. Time elapse:", round((time.time()-t),3), "secs. Shape= ", df_agg.shape)
+
+    return df_agg
+    
+#*************** Preprocess Data Part 3 : Speed Data ***************************************************
+
+def Preprocess_data_speed(df):
+    t = time.time()
+    print ("Starting processing Speed data...")
+    
+    df=df[['bookingID', 'Speed']]        
+    #**** Initializing new columns to NaN **********
+    df['70kmh_Speed']=np.NaN   
+    df['90kmh_Speed']=np.NaN
+    df['110kmh_Speed']=np.NaN 
+    df['130kmh_Speed']=np.NaN 
+        
+    #**** Mark all readings > certain limits **********
+    df.loc[df['Speed']>19.4, ['70kmh_Speed']]=1
+    df.loc[df['Speed']>25,   ['90kmh_Speed']]=1
+    df.loc[df['Speed']>30.5, ['110kmh_Speed']]=1
+    df.loc[df['Speed']>36.1, ['130kmh_Speed']]=1
+    
+    #****Aggregating Data ***********************
+    Agg= {         
+          '70kmh_Speed'         : ['sum'],
+          '90kmh_Speed'         : ['sum'],
+          '110kmh_Speed'         : ['sum'],
+          '130kmh_Speed'         : ['sum'],  
+                             }
+
+    df_agg= df.groupby('bookingID').agg(Agg)
+    df_agg.columns = pd.Index([ e[0] + "_" + e[1] for e in df_agg.columns.tolist()]) #rename all columns to single layer
+    df_agg=df_agg.reset_index()   
+    del df
+    gc.collect()
+    
+    print("   Done processing Speed data. Time elapse:", round((time.time()-t),3), "secs. Shape= ", df_agg.shape)
+    return df_agg
+    
+#*************** Feature Engineering ***************************************************************
+
+def feature_engineering(df):
+    t = time.time()
+    print ("Starting Creating Features...")
+    df['meter_run']=df['Speed_mean'] * df['second_max']
+    
+    #******* Initialize new features to NaN **********
+    
+    df['avg_excs_+ve_accr_x']= np.NaN
+    df['avg_excs_-ve_accr_x']= np.NaN
+    df['avg_excs_+ve_accr_y']= np.NaN
+    df['avg_excs_-ve_accr_y']= np.NaN
+    df['avg_excs_+ve_accr_z']= np.NaN
+    df['avg_excs_-ve_accr_z']= np.NaN
+    
+    df['avg_excs_+ve_gyro_x']= np.NaN
+    df['avg_excs_-ve_gyro_x']= np.NaN
+    df['avg_excs_+ve_gyro_y']= np.NaN
+    df['avg_excs_-ve_gyro_y']= np.NaN
+    df['avg_excs_+ve_gyro_z']= np.NaN
+    df['avg_excs_-ve_gyro_z']= np.NaN
+    
+    df['avg_over_70kmh']= np.NaN
+    df['avg_over_90kmh']= np.NaN
+    df['avg_over_110kmh']= np.NaN
+    df['avg_over_130kmh']= np.NaN
+    
+    # ***** Create new features ********************
+    
+    df['avg_excs_+ve_accr_x']= df['excs_+ve_accr_x_sum'] / df['meter_run']*1000
+    df['avg_excs_-ve_accr_x']= df['excs_-ve_accr_x_sum'] / df['meter_run']*1000
+    df['avg_excs_+ve_accr_y']= df['excs_+ve_accr_y_sum'] / df['meter_run']*1000
+    df['avg_excs_-ve_accr_y']= df['excs_-ve_accr_y_sum'] / df['meter_run']*1000
+    df['avg_excs_+ve_accr_z']= df['excs_+ve_accr_z_sum'] / df['meter_run']*1000
+    df['avg_excs_-ve_accr_z']= df['excs_-ve_accr_z_sum'] / df['meter_run']*1000
+    
+    df['avg_excs_+ve_gy_x']= df['excs_+ve_gyro_x_sum'] / df['meter_run']*1000
+    df['avg_excs_-ve_gy_x']= df['excs_-ve_gyro_x_sum'] / df['meter_run']*1000
+    df['avg_excs_+ve_gy_y']= df['excs_+ve_gyro_y_sum'] / df['meter_run']*1000
+    df['avg_excs_-ve_gy_y']= df['excs_-ve_gyro_y_sum'] / df['meter_run']*1000
+    df['avg_excs_+ve_gy_z']= df['excs_+ve_gyro_z_sum'] / df['meter_run']*1000
+    df['avg_excs_-ve_gy_z']= df['excs_-ve_gyro_z_sum'] / df['meter_run']*1000
+    
+    df['avg_over_70kmh'] = df['70kmh_Speed_sum']/ df['meter_run']
+    df['avg_over_90kmh'] = df['90kmh_Speed_sum']/ df['meter_run']
+    df['avg_over_110kmh'] = df['110kmh_Speed_sum']/ df['meter_run']
+    df['avg_over_130kmh'] = df['130kmh_Speed_sum']/ df['meter_run']
+    
+    print("   Done Feature Engineering. Time elapse:", round((time.time()-t),3), "secs. Shape= ", df.shape)
+    
+    return df
+    
+#******************* Training CatBoost Model  ********************************************************
+
+def CatBoost_Model(df_train, df_test):
+    t = time.time()
+    print("Start Training CatBoost Model...")
+    
+    feats = [f for f in df_train.columns if f not in ['label']]
+    y = df_train['label'] # feature array, Targetlabel
+    X= df_train[feats]
+    
+    #*********kFold Split*****
+    n_fold = 0
+    num_folds = 20
+    folds = StratifiedKFold(n_splits= num_folds, shuffle=True, random_state=1001)
+    
+    oof_pred = np.zeros(df_train.shape[0])
+    sub_pred = np.zeros(df_test.shape[0])
+
+    for n_fold, (Train_id, Eval_id) in enumerate(folds.split(X, y.astype('category'))):
+        t = time.time()
+        X_Train, y_Train  = X.iloc[Train_id], y.iloc[Train_id]
+        X_Eval,  y_Eval   = X.iloc[Eval_id], y.iloc[Eval_id]
+
+        catm = cat.CatBoostClassifier(
+                             iterations=700,
+                             eval_metric='AUC',
+                             random_seed = 42,
+                            
+                                        )
+    
+        catm.fit(X_Train, y_Train, eval_set=(X_Eval,y_Eval),use_best_model=True,verbose=False) #, verbose=10, early_stopping_rounds=30)
+        oof_pred[Eval_id] = catm.predict_proba(X_Eval)[:, 1]
+        sub_pred =  sub_pred + catm.predict_proba(df_test[feats])[:, 1] / num_folds
+    
+        print("Done Training fold", n_fold + 1,"Time elapse: ", round((time.time()-t),3), "secs. AUC score : ", roc_auc_score(y_Eval, oof_pred[Eval_id]))
+        t = time.time()
+        
+    overall_score = roc_auc_score(df_train['label'], oof_pred)
+    print("Training Complete,Time elapse: ", round((time.time()-t0),3), "Overall AUC score : ", overall_score)  
+    del catm
+    gc.collect()
+
+    return oof_pred, sub_pred
+
+#******************* Calling Functions *****************************************************************  
+
+cleaned_labels, holdout_labels = Delete_conflict()
+#holdout_labels, train_labels = Split(cleaned_labels)
+df_combined = Combine_data ()
+agg_basic = Preprocess_data_Basic (df_combined)
+agg_accr=Preprocess_data_accr(df_combined)
+agg_gyro=Preprocess_data_gyro(df_combined)
+agg_speed= Preprocess_data_speed(df_combined)
+
+del df_combined
+gc.collect()
+
+#************** Combining Preprocessed Data **************************************************************
+
+agg_consolidate = pd.merge(agg_accr, agg_basic, on='bookingID')
+agg_consolidate = pd.merge(agg_gyro, agg_consolidate, on='bookingID')
+agg_consolidate = pd.merge(agg_speed, agg_consolidate, on='bookingID')
+
+print ("Shape before feature engineering=", agg_consolidate.shape)
+
+#************** Call Function to feature engineering & Model Training***
+
+final_consolidated = feature_engineering(agg_consolidate)
+
+train_set = pd.merge(cleaned_labels, final_consolidated, on='bookingID') 
+test_set =  pd.merge(holdout_labels, final_consolidated, on='bookingID')
+
+cat_oof_pred, cat_sub_pred = CatBoost_Model(train_set, test_set)
+
+print("Total Kernel Run time: ", round((time.time()-t0),3))
+
+print ("Hold out set ROC Scores=", roc_auc_score(test_set['label'], cat_sub_pred ) )
+
+
+
+
+    
