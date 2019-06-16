@@ -330,7 +330,7 @@ def CatBoost_Model(df_train, df_test):
         X_Eval,  y_Eval   = X.iloc[Eval_id], y.iloc[Eval_id]
 
         catm = cat.CatBoostClassifier(
-                             iterations=700,
+                             iterations=1000,
                              eval_metric='AUC',
                              random_seed = 42,
                             
