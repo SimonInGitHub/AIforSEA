@@ -386,7 +386,7 @@ def knn_Model(df_train, df_test):
         X_Eval,  y_Eval   = X.iloc[Eval_id], y.iloc[Eval_id]
         
         knn = KNeighborsClassifier(n_neighbors=53)
-        knn.fit(X_train, y_train)      
+        knn.fit(X_Train, y_Train)      
 
         oof_pred[Eval_id] = knn.predict_proba(X_Eval)[:, 1]
         sub_pred =  sub_pred + knn.predict_proba(df_test[['bookingID']] )[:, 1] / num_folds
