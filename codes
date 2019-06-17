@@ -12,12 +12,12 @@ import gc
 import xgboost as xgb
 import catboost as cat
 import lightgbm as lgb
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import StratifiedKFold
 
 t0 = time.time()
 t = time.time()
-
 #*************** Delete bookingIDs with conflicting target labels ***********************************
 
 def Delete_conflict():  
@@ -297,10 +297,10 @@ def feature_engineering(df):
     df['avg_excs_+ve_gy_z']= df['excs_+ve_gyro_z_sum'] / df['meter_run']*1000
     df['avg_excs_-ve_gy_z']= df['excs_-ve_gyro_z_sum'] / df['meter_run']*1000
     
-    df['avg_over_70kmh'] = df['70kmh_Speed_sum']/ df['meter_run']
-    df['avg_over_90kmh'] = df['90kmh_Speed_sum']/ df['meter_run']
-    df['avg_over_110kmh'] = df['110kmh_Speed_sum']/ df['meter_run']
-    df['avg_over_130kmh'] = df['130kmh_Speed_sum']/ df['meter_run']
+    df['avg_over_70kmh'] = df['70kmh_Speed_sum']/ df['meter_run']*1000
+    df['avg_over_90kmh'] = df['90kmh_Speed_sum']/ df['meter_run']*1000
+    df['avg_over_110kmh'] = df['110kmh_Speed_sum']/ df['meter_run']*1000
+    df['avg_over_130kmh'] = df['130kmh_Speed_sum']/ df['meter_run']*1000
     
     print("   Done Feature Engineering. Time elapse:", round((time.time()-t),3), "secs. Shape= ", df.shape)
     
@@ -311,6 +311,19 @@ def feature_engineering(df):
 def CatBoost_Model(df_train, df_test):
     t = time.time()
     print("Start Training CatBoost Model...")
+    
+    #**** delete features with zero importance, found by running a separate model
+    
+    poorest= ['Accuracy_min', 'avg_excs_+ve_gyro_z', 'avg_excs_-ve_accr_y', '+ve_accr_y_mean', 'avg_excs_-ve_accr_z', 'avg_excs_+ve_gyro_x',
+             'avg_excs_-ve_gyro_x', 'avg_excs_+ve_gyro_y', 'avg_excs_-ve_gyro_y', '-ve_accr_y_min', 'avg_excs_-ve_gyro_z', 'avg_over_90kmh',
+             '-ve_accr_y_max', 'avg_over_130kmh', '+ve_gyro_x_max', '-ve_accr_y_mean', '130kmh_Speed_sum', '110kmh_Speed_sum', '+ve_gyro_y_min',
+             '-ve_gyro_y_min', 'excs_-ve_accr_z_sum', '+ve_accr_x_median', 'Accuracy_mean', 'excs_+ve_accr_z_sum', 'excs_-ve_gyro_y_sum',
+             'Bearing_min', 'Bearing_max', 'Bearing_mean', 'excs_-ve_accr_y_sum', 'second_min', 'excs_+ve_gyro_x_sum', '-ve_gyro_z_median',
+             'excs_-ve_accr_x_sum', '+ve_accr_z_mean', '+ve_accr_x_mean', '+ve_gyro_z_max', '+ve_gyro_z_min', '-ve_gyro_y_median',
+             '-ve_gyro_y_mean', '-ve_accr_y_median']
+    
+    important_col=[col for col in df_train.columns if col not in poorest]    
+    df_train=df_train.loc[:,important_col]
     
     feats = [f for f in df_train.columns if f not in ['label']]
     y = df_train['label'] # feature array, Targetlabel
@@ -349,6 +362,89 @@ def CatBoost_Model(df_train, df_test):
     gc.collect()
 
     return oof_pred, sub_pred
+    
+#******************* Training KNN Model  ************************************************************    
+
+def knn_Model(df_train, df_test):
+    print("Start Training knn Model...")
+    #*********kFold Split*****
+    n_fold = 0
+    overall_score=0
+    num_folds = 10
+    
+    y = df_train['label'] # feature array, Targetlabel
+    X = df_train[['bookingID']]
+    
+    folds = StratifiedKFold(n_splits= num_folds, shuffle=True, random_state=1001)
+    
+    oof_pred = np.zeros(df_train.shape[0])
+    sub_pred = np.zeros(df_test.shape[0])
+
+    for n_fold, (Train_id, Eval_id) in enumerate(folds.split(X, y.astype('category'))):
+        t = time.time()
+        X_Train, y_Train  = X.iloc[Train_id], y.iloc[Train_id]
+        X_Eval,  y_Eval   = X.iloc[Eval_id], y.iloc[Eval_id]
+        
+        knn = KNeighborsClassifier(n_neighbors=53)
+        knn.fit(X_train, y_train)      
+
+        oof_pred[Eval_id] = knn.predict_proba(X_Eval)[:, 1]
+        sub_pred =  sub_pred + knn.predict_proba(df_test[['bookingID']] )[:, 1] / num_folds
+    
+        print("   Done Training fold", n_fold + 1,"Time elapse: ", round((time.time()-t),3), "secs. AUC score : ", roc_auc_score(y_Eval, oof_pred[Eval_id]))
+        t = time.time()
+        
+    overall_score = roc_auc_score(df_train['label'], oof_pred)
+    print("Training Complete,Time elapse: ", round((time.time()-t0),3), "Overall AUC score : ", overall_score)  
+    
+    del knn
+    gc.collect()
+
+    return oof_pred, sub_pred
+    
+#******************* Training Stacking Model (CatBoost)  ********************************************************   
+
+def Stacking_Model(df_train, df_test):
+    print("Start Training Stacking Model...")
+    
+    feats = [f for f in df_train.columns if f not in ['label']]
+    y = df_train['label'] # feature array, Targetlabel
+    X= df_train[feats]
+    
+    #*********kFold Split*****
+    n_fold = 0
+    num_folds = 10
+    folds = StratifiedKFold(n_splits= num_folds, shuffle=True, random_state=1001)
+    
+    oof_pred = np.zeros(df_train.shape[0])
+    sub_pred = np.zeros(df_test.shape[0])
+
+    for n_fold, (Train_id, Eval_id) in enumerate(folds.split(X, y.astype('category'))):
+        t = time.time()
+        X_Train, y_Train  = X.iloc[Train_id], y.iloc[Train_id]
+        X_Eval,  y_Eval   = X.iloc[Eval_id], y.iloc[Eval_id]
+
+        clf = cat.CatBoostClassifier (
+                            iterations=500,
+                            eval_metric='AUC',
+                            random_seed = 42,
+                                        )
+    
+        clf.fit(X_Train, y_Train, eval_set=(X_Eval,y_Eval),use_best_model=True,verbose=False) #, verbose=10, early_stopping_rounds=30)
+        oof_pred[Eval_id] = clf.predict_proba(X_Eval)[:, 1]
+        sub_pred =  sub_pred + clf.predict_proba(df_test[feats])[:, 1] / num_folds
+    
+        print("Done Training fold", n_fold + 1,"Time elapse: ", round((time.time()-t),3), "secs. AUC score : ", roc_auc_score(y_Eval, oof_pred[Eval_id]))
+        t = time.time()
+        
+    overall_score = roc_auc_score(df_train['label'], oof_pred)
+    print("Training Complete,Time elapse: ", round((time.time()-t0),3), "Overall AUC score : ", overall_score)  
+    del clf
+    gc.collect()
+
+    return sub_pred
+
+#XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
 #******************* Calling Functions *****************************************************************  
 
@@ -371,20 +467,25 @@ agg_consolidate = pd.merge(agg_speed, agg_consolidate, on='bookingID')
 
 print ("Shape before feature engineering=", agg_consolidate.shape)
 
-#************** Call Function to feature engineering & Model Training***
+#************** Call Function to feature engineering & Model Training************************************
 
 final_consolidated = feature_engineering(agg_consolidate)
+print ("Shape after feature engineering=", final_consolidated.shape)
 
 train_set = pd.merge(cleaned_labels, final_consolidated, on='bookingID') 
 test_set =  pd.merge(holdout_labels, final_consolidated, on='bookingID')
 
 cat_oof_pred, cat_sub_pred = CatBoost_Model(train_set, test_set)
+knn_oof_pred, knn_sub_pred = knn_Model(train_set, test_set)
+
+#************** Prepare stacking data set and call to stacking model ************************************
+
+oof_stack = pd.DataFrame({'cat':cat_oof_pred,'knn':knn_oof_pred, 'label':train_set['label'] })
+sub_stack = pd.DataFrame({'cat':cat_sub_pred,'knn':knn_sub_pred})
+
+final_sub_pred = Stacking_Model(oof_stack, sub_stack) # call to Stacking Function
 
 print("Total Kernel Run time: ", round((time.time()-t0),3))
 
-print ("Hold out set ROC Scores=", roc_auc_score(test_set['label'], cat_sub_pred ) )
-
-
-
-
+print ("Hold out set ROC-AUC Scores=", roc_auc_score(test_set['label'], final_sub_pred ) )
     
